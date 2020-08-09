@@ -67,17 +67,51 @@ http_loop(Socket) ->
     end.
 
 ws_loop(Socket) ->
-    io:format("ws_loop~n"),
     inet:setopts(Socket, [{active, once}]),
     receive
         {tcp, Socket, Msg} ->
-            io:format("ws_loop() recv~n"),
             try eof_ws:parse(Msg) of
-                {ok, Fin, OPCode, Payload} -> handle_ws(Socket, Fin, OPCode, Payload);
+                {ok, Fin, OPCode, Length, Payload} ->
+                    io:format("ok~n"),
+                    handle_ws(Socket, Fin, OPCode, Payload);
+                {more_plain, Fin, OPCode, RemLen, Payload} ->
+                    ws_continue_plain(Socket, Fin, OPCode, RemLen, Payload);
+                {more_masked, Fin, OPCode, Mask, RemLen, Payload} ->
+                    ws_continue_masked(Socket, Fin, OPCode, Mask, RemLen, Payload);
+                W -> io:format("closing~n~p~n", [W]),
+                    gen_tcp:close(Socket)
+            catch
+                _ -> gen_tcp:close(Socket)
+            end;
+        _ -> gen_tcp:close(Socket)
+    end.
+
+ws_continue_plain(Socket, Fin, OPCode, RemLen, Payload) ->
+    inet:setopts(Socket, [{active, once}]),
+    receive
+       {tcp, Socket, Msg} ->
+           case eof_ws:dump(RemLen, Msg) of
+               {ok, RestPayload} ->
+                   handle_ws(Socket, Fin, OPCode, <<Payload, RestPayload>>);
+               {more_plain, NewRemLen, MorePayload} ->
+                   ws_continue_plain(Socket, Fin, OPCode, NewRemLen, <<Payload, MorePayload>>);
+               _ -> gen_tcp:close(Socket)
+           end;
+       _ -> gen_tcp:close(Socket)
+    end.
+
+ws_continue_masked(Socket, Fin, OPCode, {M1, M2, M3, M4}, RemLen, Payload) ->
+    inet:setopts(Socket, [{active, once}]),
+    receive
+        {tcp, Socket, Msg} ->
+            try eof_ws:decode(RemLen,M1, M2, M3, M4, Msg) of
+                {ok, Decoded} ->
+                    handle_ws(Socket, Fin, OPCode, <<Payload/binary, Decoded/binary>>);
+                {more_masked,Mask, NewRemLen, Decoded} ->
+                    ws_continue_masked(Socket, Fin, OPCode, Mask, NewRemLen, <<Payload/binary, Decoded/binary>>);
                 _ -> gen_tcp:close(Socket)
             catch
                 _ -> gen_tcp:close(Socket)
             end;
         _ -> gen_tcp:close(Socket)
-    end,
-    io:format("ws_loop ended~n").
+    end.
