@@ -1,6 +1,10 @@
 -module(eof_ws_server).
 -behavior(supervisor_bridge).
+-export([start_link/1]).
 -export([init/1, terminate/2]).
+
+start_link({port, Port}) ->
+    supervisor_bridge:start_link({local, eof_ws_server}, eof_ws_server, {port, Port}).
 
 %%=============================================================================
 %% OTP callbacks
@@ -53,7 +57,7 @@ http_loop(Socket) ->
         {tcp, Socket, Msg} ->
             io:format("http_loop() recv~n"),
             try eof_http:parse(Msg) of
-                {ok, Request} ->
+                Request ->
                     handle_http(Socket, Request)
             catch
                 _ ->
