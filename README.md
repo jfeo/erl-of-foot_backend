@@ -10,20 +10,22 @@ The backend is built with Erlang/OTP, and is implemented as a websocket server.
 Build
 -----
 
-So far, no build system has been setup. You can compile the modules by:
+Build the project using the `rebar3` build system
 
-```
-erlc src/*.erl
-```
+    $ rebar3 compile
 
+Development
+-----------
+
+EUnit tests are placed in the `./test`-directory, and can be run with
+
+    $ rebar eunit
 
 Run
 ---
 
-Run the server by
+Run the server in an erlang shell with
 
-```
-eof_ws_server:init({port, PORT}).
-```
+    $ rebar shell
 
 Enjoy!
