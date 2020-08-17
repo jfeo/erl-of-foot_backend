@@ -37,7 +37,7 @@ handle_http(Socket, {"GET", _RequestURI, _HTTPVersion, Headers}) ->
             ResponseMsg = eof_http:generate(
                 "101",
                 "Switching Protocols",
-                [{"Upgrade", "websocket"}, {"Connection", "Upgrade"}, {"Sec-Websocket-Accept", AcceptHash}]
+                [{"Upgrade", "websocket"}, {"Connection", "Upgrade"}, {"Sec-WebSocket-Accept", AcceptHash}]
             ),
             gen_tcp:send(Socket, ResponseMsg),
             io:format("starting ws_loop()~n"),
