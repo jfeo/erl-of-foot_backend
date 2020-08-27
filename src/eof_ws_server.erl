@@ -1,37 +1,113 @@
 -module(eof_ws_server).
--behavior(supervisor_bridge).
+-behavior(gen_server).
 -export([start_link/1]).
--export([init/1, terminate/2]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3]).
+-record(state, {phase, socket}).
 
-start_link({port, Port}) ->
-    supervisor_bridge:start_link({local, eof_ws_server}, eof_ws_server, {port, Port}).
+start_link(ListenSocket) ->
+    gen_server:start_link(?MODULE, ListenSocket, []).
 
 %%=============================================================================
 %% OTP callbacks
 %%=============================================================================
 
-init({port, Port}) ->
-    Pid = spawn_link(fun() ->
-        {ok, ListenSocket} = gen_tcp:listen(Port, [binary, {active, false}]),
-        accept_loop(ListenSocket)
-    end),
-    {ok, Pid, undefined}.
+init(ListenSocket) ->
+    io:format("initializing~n"),
+    gen_server:cast(self(), accept),
+    {ok, #state{phase=accept, socket=ListenSocket}}.
 
-terminate(_Reason, _State) -> ok.
+handle_cast(accept, S = #state{phase=accept, socket=ListenSocket}) ->
+    {ok, AcceptSocket} = gen_tcp:accept(ListenSocket),
+    ok = inet:setopts(AcceptSocket, [{active, once}]),
+    io:format("accepting~n"),
+    eof_backend_sup:start_socket(),
+    {noreply, S#state{socket=AcceptSocket, phase=handshake}}.
+
+handle_info({tcp, _Socket, Msg}, S = #state{socket=Socket, phase=handshake}) ->
+    ok = inet:setopts(Socket, [{active, once}]),
+    io:format("parsing http message~n"),
+    try eof_http:parse(Msg) of
+        Request -> handle_http(S, Socket, Request)
+    catch
+        _ ->
+            gen_tcp:send(Socket, eof_http:generate(
+                "500",
+                "Internal Server Error",
+                []
+            )),
+            {noreply, S}
+    end;
+ 
+handle_info({tcp, _Socket, Msg}, S = #state{socket=Socket, phase=ws}) ->
+    ok = inet:setopts(Socket, [{active, once}]),
+    io:format("parsing new websocket message~n"),
+    try eof_ws:parse(Msg) of
+        {ok, Fin, OPCode, _Length, Payload} ->
+            handle_message(S, Fin, OPCode, Payload);
+        {more_plain, Fin, OPCode, RemLen, Payload} ->
+            Phase = {more_plain, Fin, OPCode, RemLen, Payload},
+            {noreply, S#state{phase=Phase}};
+        {more_masked, Fin, OPCode, Mask, RemLen, Payload} ->
+            Phase = {more_masked, Fin, OPCode, Mask, RemLen, Payload},
+            {noreply, S#state{phase=Phase}}
+    catch
+        _ -> {noreply, S}
+    end;
+
+handle_info({tcp, _Socket, Msg}, S = #state{socket=Socket, phase={more_plain, Fin, OPCode, RemLen, Payload}}) ->
+    ok = inet:setopts(Socket, [{active, once}]),
+    io:format("parsing new websocket message~n"),
+    case eof_ws:dump(RemLen, Msg) of
+        {ok, RestPayload} ->
+            handle_message(S#state{phase=ws}, Fin, OPCode, <<Payload, RestPayload>>);
+        {more_plain, NewRemLen, MorePayload} ->
+            Phase = {more_plain, Fin, OPCode, NewRemLen, <<Payload, MorePayload>>},
+            {noreply, S#state{phase=Phase}}
+    end;
+
+handle_info({tcp, _Socket, Msg}, S = #state{socket=Socket, phase={more_masked, Fin, OPCode, Mask, RemLen, Payload}}) ->
+    ok = inet:setopts(Socket, [{active, once}]),
+    io:format("parsing continued websocket message~n"),
+    {M1, M2, M3, M4} = Mask,
+    try eof_ws:decode(RemLen, M1, M2, M3, M4, Msg) of
+        {ok, Decoded} ->
+            handle_message(S#state{phase=ws}, Fin, OPCode, <<Payload, Decoded>>);
+        {more_masked, NewMask, NewRemLen, Decoded} ->
+            Phase = {more_masked, Fin, OPCode, NewMask, NewRemLen, <<Payload/binary, Decoded/binary>>},
+            {noreply, S#state{phase=Phase}}
+    catch
+        _ -> {noreply, S#state{phase=ws}}
+    end;
+
+handle_info({tcp, _Socket, Msg}, S = #state{socket=Socket}) ->
+    ok = inet:setopts(Socket, [{active, once}]),
+    io:format("got ill-fitting tcp message~n"),
+    io:format("state=~p~n", [S]),
+    io:format("message=~p~n", [Msg]),
+    {noreply, S}.
+
+%% Stub implementation
+handle_call(_, _, State) ->
+    {noreply, State}.
+
+%% Stub implementation
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
 
 %%=============================================================================
 %% Private implementation
 %%=============================================================================
 
-accept_loop(ListenSocket) ->
-    case gen_tcp:accept(ListenSocket) of
-        {ok, Socket} ->
-            spawn(fun() -> accept_loop(ListenSocket) end),
-            http_loop(Socket);
-        {error, Reason} -> {error, Reason}
-    end.
+handle_message(State, Fin, OPCode, _Msg) ->
+    io:format("[~p] [~p]~n", [Fin, OPCode]),
+    {noreply, State}.
 
-handle_http(Socket, {"GET", _RequestURI, _HTTPVersion, Headers}) ->
+send(Socket, Msg) ->
+    ok = gen_tcp:send(Socket, Msg),
+    ok = inet:setopts(Socket, [{active, once}]),
+    ok.
+
+handle_http(State, Socket, {"GET", _RequestURI, _HTTPVersion, Headers}) ->
     try eof_ws:handshake(Headers) of
         {ok, AcceptHash, _Protocols} ->
             ResponseMsg = eof_http:generate(
@@ -39,83 +115,9 @@ handle_http(Socket, {"GET", _RequestURI, _HTTPVersion, Headers}) ->
                 "Switching Protocols",
                 [{"Upgrade", "websocket"}, {"Connection", "Upgrade"}, {"Sec-WebSocket-Accept", AcceptHash}]
             ),
-            gen_tcp:send(Socket, ResponseMsg),
-            io:format("starting ws_loop()~n"),
-            ws_loop(Socket);
-        {error, _} -> http_loop(Socket)
+            ok = send(Socket, ResponseMsg),
+            {noreply, State#state{phase=ws}};
+        {error, _} -> {noreply, State}
     catch
-        _ -> error
-    end.
-
-handle_ws(Socket, Fin, OPCode, Payload) ->
-    io:format("Server: Fin=~p OPCode=~p Payload=~p~n", [Fin, OPCode, Payload]),
-    ws_loop(Socket).
-
-http_loop(Socket) ->
-    inet:setopts(Socket, [{active, once}]),
-    receive
-        {tcp, Socket, Msg} ->
-            io:format("http_loop() recv~n"),
-            try eof_http:parse(Msg) of
-                Request ->
-                    handle_http(Socket, Request)
-            catch
-                _ ->
-                    gen_tcp:send(Socket, eof_http:generate(
-                        "500",
-                        "Internal Server Error",
-                        []
-                    ))
-            end;
-        _ -> gen_tcp:close(Socket)
-    end.
-
-ws_loop(Socket) ->
-    inet:setopts(Socket, [{active, once}]),
-    receive
-        {tcp, Socket, Msg} ->
-            try eof_ws:parse(Msg) of
-                {ok, Fin, OPCode, Length, Payload} ->
-                    io:format("ok~n"),
-                    handle_ws(Socket, Fin, OPCode, Payload);
-                {more_plain, Fin, OPCode, RemLen, Payload} ->
-                    ws_continue_plain(Socket, Fin, OPCode, RemLen, Payload);
-                {more_masked, Fin, OPCode, Mask, RemLen, Payload} ->
-                    ws_continue_masked(Socket, Fin, OPCode, Mask, RemLen, Payload);
-                W -> io:format("closing~n~p~n", [W]),
-                    gen_tcp:close(Socket)
-            catch
-                _ -> gen_tcp:close(Socket)
-            end;
-        _ -> gen_tcp:close(Socket)
-    end.
-
-ws_continue_plain(Socket, Fin, OPCode, RemLen, Payload) ->
-    inet:setopts(Socket, [{active, once}]),
-    receive
-       {tcp, Socket, Msg} ->
-           case eof_ws:dump(RemLen, Msg) of
-               {ok, RestPayload} ->
-                   handle_ws(Socket, Fin, OPCode, <<Payload, RestPayload>>);
-               {more_plain, NewRemLen, MorePayload} ->
-                   ws_continue_plain(Socket, Fin, OPCode, NewRemLen, <<Payload, MorePayload>>);
-               _ -> gen_tcp:close(Socket)
-           end;
-       _ -> gen_tcp:close(Socket)
-    end.
-
-ws_continue_masked(Socket, Fin, OPCode, {M1, M2, M3, M4}, RemLen, Payload) ->
-    inet:setopts(Socket, [{active, once}]),
-    receive
-        {tcp, Socket, Msg} ->
-            try eof_ws:decode(RemLen,M1, M2, M3, M4, Msg) of
-                {ok, Decoded} ->
-                    handle_ws(Socket, Fin, OPCode, <<Payload/binary, Decoded/binary>>);
-                {more_masked,Mask, NewRemLen, Decoded} ->
-                    ws_continue_masked(Socket, Fin, OPCode, Mask, NewRemLen, <<Payload/binary, Decoded/binary>>);
-                _ -> gen_tcp:close(Socket)
-            catch
-                _ -> gen_tcp:close(Socket)
-            end;
-        _ -> gen_tcp:close(Socket)
+        _ -> {noreply, State}
     end.

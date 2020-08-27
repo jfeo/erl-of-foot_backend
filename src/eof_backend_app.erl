@@ -9,8 +9,8 @@
 
 -export([start/2, stop/1]).
 
-start(_StartType, StartArgs) ->
-    eof_backend_sup:start_link(5000).
+start(_StartType, Port) ->
+    eof_backend_sup:start_link(Port).
 
 stop(_State) ->
     ok.
