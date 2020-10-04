@@ -19,13 +19,13 @@ Development
 
 EUnit tests are placed in the `./test`-directory, and can be run with
 
-    $ rebar eunit
+    $ rebar3 eunit
 
 Run
 ---
 
 Run the server in an erlang shell with
 
-    $ rebar shell
+    $ rebar3 shell
 
 Enjoy!
